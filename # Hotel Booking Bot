@@ -1,0 +1,13 @@
+# Hotel Booking Bot
+
+A fully working Telegram bot for booking hotel rooms on Telegram.
+
+Features:
+- Choose room type with buttons
+- Enter name, phone, check-in & check-out dates
+- Confirm booking
+- All bookings saved in database
+- Runs 24/7 for free
+
+Deployed on Render.com  
+Made with ❤️ using Python + pyTelegramBotAPI
