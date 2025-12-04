@@ -1,0 +1,195 @@
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+import pytz
+import os
+
+# Your bot token from BotFather
+BOT_TOKEN = os.getenv(8216496503:AAHXjvxHrYBhJsTWIUi7z2pumlm2dCKotWU)  # We'll set this in Replit secrets
+
+# Config - Customize these!
+SERVICES = {
+    "Haircut": {"price": "5000", "duration_min": 45},
+    "Manicure": {"price": "4000", "duration_min": 60},
+    "Massage": {"price": "7000", "duration_min": 90},
+}
+WORKING_HOURS_START = 10  # 10 AM
+WORKING_HOURS_END = 20    # 8 PM
+TIMEZONE_NAME = "UTC"     # Change to yours, e.g., "America/New_York" (see pytz.all_timezones)
+ADMIN_CHAT_ID = 123456789  # Replace with YOUR Telegram user ID (get it from @userinfobot)
+
+# Bookings storage (simple dict for now; upgrade to DB later)
+BOOKINGS = {}  # Format: {(date, time): {"service": "...", "user": "...", "phone": "..."}}
+
+# States for FSM
+class BookingStates(StatesGroup):
+    choosing_service = State()
+    choosing_date = State()
+    choosing_time = State()
+    entering_name = State()
+    entering_phone = State()
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+
+# Init bot & dispatcher
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+tz = pytz.timezone(TIMEZONE_NAME)
+
+async def get_calendar_keyboard(year: int, month: int) -> InlineKeyboardMarkup:
+    """Simple inline calendar (aiogram doesn't have built-in, but this is a basic one)"""
+    keyboard = []
+    # Month header
+    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    keyboard.append([InlineKeyboardButton(text=f"{month_names[month-1]} {year}", callback_data="ignore")])
+    
+    # Days
+    week_days = ["M", "T", "W", "T", "F", "S", "S"]
+    keyboard.append([InlineKeyboardButton(text=day, callback_data="ignore") for day in week_days])
+    
+    today = datetime.now(tz).date()
+    month_days = []
+    for day in range(1, 32):
+        try:
+            date = tz.localize(datetime(year, month, day)).date()
+            if date < today:
+                continue
+            btn_text = str(day)
+            callback = f"date:{year}-{month:02d}-{day:02d}"
+            month_days.append(InlineKeyboardButton(text=btn_text, callback_data=callback))
+        except ValueError:
+            break
+    
+    # Pad weeks
+    while len(month_days) % 7 != 0:
+        month_days.append(InlineKeyboardButton(text=" ", callback_data="ignore"))
+    
+    for i in range(0, len(month_days), 7):
+        keyboard.append(month_days[i:i+7])
+    
+    # Nav buttons
+    nav_row = []
+    if month > 1:
+        nav_row.append(InlineKeyboardButton(text="◀", callback_data=f"month:{year}:{month-1}"))
+    nav_row.append(InlineKeyboardButton(text="Today", callback_data=f"date:{today.year}-{today.month:02d}-{today.day:02d}"))
+    if month < 12:
+        nav_row.append(InlineKeyboardButton(text="▶", callback_data=f"month:{year}:{month+1}"))
+    keyboard.append(nav_row)
+    keyboard.append([InlineKeyboardButton(text="Cancel", callback_data="cancel")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+@dp.message(Command("start"))
+async def start_booking(message: types.Message, state: FSMContext):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=service, callback_data=f"service:{service}") for service in SERVICES.keys()]
+    ])
+    await message.answer("Welcome! Choose a service to book:", reply_markup=keyboard)
+    await state.set_state(BookingStates.choosing_service)
+
+@dp.callback_query(lambda c: c.data.startswith("service:"))
+async def select_service(callback: CallbackQuery, state: FSMContext):
+    service = callback.data.split(":")[1]
+    await state.update_data(service=service)
+    year, month = datetime.now(tz).year, datetime.now(tz).month
+    keyboard = await get_calendar_keyboard(year, month)
+    await callback.message.edit_text(f"Selected: {service} ({SERVICES[service]['price']} - {SERVICES[service]['duration_min']} min)\nPick a date:", reply_markup=keyboard)
+    await state.set_state(BookingStates.choosing_date)
+
+@dp.callback_query(lambda c: c.data.startswith("date:"))
+async def select_date(callback: CallbackQuery, state: FSMContext):
+    date_str = callback.data.split(":")[1]
+    await state.update_data(date=date_str)
+    await callback.message.edit_text(f"Date: {date_str}\nNow pick a time (hour):", reply_markup=get_time_keyboard(date_str))
+    await state.set_state(BookingStates.choosing_time)
+
+def get_time_keyboard(date_str: str) -> InlineKeyboardMarkup:
+    keyboard = []
+    start_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    today = datetime.now(tz).date()
+    if start_date == today:
+        start_hour = datetime.now(tz).hour + 1
+    else:
+        start_hour = WORKING_HOURS_START
+    
+    for hour in range(start_hour, WORKING_HOURS_END):
+        callback = f"time:{date_str}:{hour:02d}:00"
+        if not is_slot_available(date_str, f"{hour:02d}:00"):
+            continue  # Skip booked slots (basic check)
+        keyboard.append([InlineKeyboardButton(text=f"{hour}:00", callback_data=callback)])
+    keyboard.append([InlineKeyboardButton(text="Back", callback_data="back_date")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def is_slot_available(date_str: str, time_str: str) -> bool:
+    slot_key = (date_str, time_str)
+    return slot_key not in BOOKINGS
+
+@dp.callback_query(lambda c: c.data.startswith("time:"))
+async def select_time(callback: CallbackQuery, state: FSMContext):
+    time_str = callback.data.split(":", 2)[2]
+    data = await state.get_data()
+    date_str = data["date"]
+    service = data["service"]
+    duration = SERVICES[service]["duration_min"]
+    
+    # Basic overlap check (simplified)
+    slot_key = (date_str, time_str)
+    if slot_key in BOOKINGS:
+        await callback.answer("Slot taken! Pick another.", show_alert=True)
+        return
+    
+    await state.update_data(time=time_str)
+    await callback.message.edit_text(f"Date: {date_str} at {time_str}\nService: {service}\n\nEnter your full name:")
+    await state.set_state(BookingStates.entering_name)
+
+@dp.message(BookingStates.entering_name)
+async def enter_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Enter your phone number (e.g., +1-123-456-7890):")
+    await state.set_state(BookingStates.entering_phone)
+
+@dp.message(BookingStates.entering_phone)
+async def enter_phone(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    booking = {
+        "service": data["service"],
+        "date": data["date"],
+        "time": data["time"],
+        "name": data["name"],
+        "phone": message.text,
+        "user_id": message.from_user.id
+    }
+    slot_key = (data["date"], data["time"])
+    BOOKINGS[slot_key] = booking
+    
+    # Send confirmation to user
+    confirm_text = f"✅ Booking confirmed!\nService: {booking['service']}\nDate/Time: {booking['date']} {booking['time']}\nName: {booking['name']}\nPhone: {booking['phone']}"
+    await message.answer(confirm_text)
+    
+    # Send to admin
+    admin_text = f"🔔 New booking:\n{confirm_text}\nUser: @{message.from_user.username or 'no username'} (ID: {message.from_user.id})"
+    await bot.send_message(ADMIN_CHAT_ID, admin_text)
+    
+    await state.clear()
+
+# Other callbacks (month nav, cancel, etc.) - simplified for brevity
+@dp.callback_query(lambda c: c.data == "cancel")
+async def cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("Booking cancelled. /start to try again.")
+
+# Add more handlers as needed (e.g., for month nav - expand get_calendar_keyboard logic)
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
